@@ -238,12 +238,12 @@ func newWithStorage(ctx context.Context, config *Config, storage keyBlobStorage)
 
 	addr := vsock.Addr{CID: cid, Port: port}
 	log.Infof("(Nitro): connecting to the enclave signer on %v...", &addr)
-	conn, err := vsock.Dial(&addr)
-	if err != nil {
-		return nil, fmt.Errorf("(Nitro): %w", err)
+
+	dial := func(_ context.Context) (net.Conn, error) {
+		return vsock.Dial(&addr)
 	}
 
-	v, err := newWithConn(ctx, conn, rpcCred, storage)
+	v, err := newWithClient(ctx, rpc.NewClient(dial, rpcCred), storage)
 	if err != nil {
 		return nil, err
 	}
@@ -251,17 +251,20 @@ func newWithStorage(ctx context.Context, config *Config, storage keyBlobStorage)
 	return v, nil
 }
 
-func newWithConn[C any](ctx context.Context, conn net.Conn, credentials *C, storage keyBlobStorage) (*NitroVault[C], error) {
-	client := rpc.NewClient[C](conn)
+func newWithClient[C any](ctx context.Context, client *rpc.Client[C], storage keyBlobStorage) (*NitroVault[C], error) {
 	client.Logger = log.StandardLogger()
 
-	if err := client.Initialize(ctx, credentials); err != nil {
+	// Open the initial connection eagerly so vault construction fails
+	// fast if the enclave is unreachable. Subsequent reconnects happen
+	// transparently inside the rpc.Client.
+	if err := client.Connect(ctx); err != nil {
+		_ = client.Close()
 		return nil, fmt.Errorf("(Nitro): %w", err)
 	}
 
-	// populate from storage
 	r, err := storage.GetKeys(ctx)
 	if err != nil {
+		_ = client.Close()
 		return nil, fmt.Errorf("(Nitro): %w", err)
 	}
 
@@ -270,10 +273,12 @@ func newWithConn[C any](ctx context.Context, conn net.Conn, credentials *C, stor
 		log.WithField("pkh", k.PublicKeyHash).Debug("Importing encrypted key")
 		res, err := client.Import(ctx, k.EncryptedPrivateKey)
 		if err != nil {
+			_ = client.Close()
 			return nil, fmt.Errorf("(Nitro): %w", err)
 		}
 		p, err := res.PublicKey.PublicKey()
 		if err != nil {
+			_ = client.Close()
 			return nil, fmt.Errorf("(Nitro): %w", err)
 		}
 		keys = append(keys, &nitroKey{
@@ -282,6 +287,7 @@ func newWithConn[C any](ctx context.Context, conn net.Conn, credentials *C, stor
 		})
 	}
 	if err := r.Err(); err != nil {
+		_ = client.Close()
 		return nil, fmt.Errorf("(Nitro): %w", err)
 	}
 
