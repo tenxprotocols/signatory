@@ -67,12 +67,10 @@ func rpcTool(cid, port uint64, keyID string) error {
 	if err != nil {
 		return err
 	}
-
-	client := rpc.NewClient[rpc.AWSCredentials](conn)
-	defer client.Close()
+	defer conn.Close()
 
 	log.Println("Sending credentials...")
-	if err := client.Initialize(context.Background(), cred); err != nil {
+	if err := rpc.InitializeConn(context.Background(), conn, cred, nil); err != nil {
 		return err
 	}
 
@@ -94,7 +92,7 @@ func rpcTool(cid, port uint64, keyID string) error {
 			continue
 		}
 
-		res, err := rpc.RoundTripRaw[any](context.Background(), client.Conn(), &req, nil)
+		res, err := rpc.RoundTripRaw[any](context.Background(), conn, &req, nil)
 		if err != nil {
 			return err
 		}
