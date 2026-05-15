@@ -64,19 +64,15 @@ func rpcTool(ip string, port uint64, wipPath string, keyPath string) error {
 	}
 
 	addr := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
-	var conn net.Conn
 	log.Printf("Connecting to the enclave signer on %s...\n", addr)
-	conn, err = net.Dial("tcp", addr)
-
+	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return err
 	}
-
-	client := rpc.NewClient[rpc.ConfidentialSpaceCredentials](conn)
-	defer client.Close()
+	defer conn.Close()
 
 	log.Printf("Sending credentials to %s...\n", cred)
-	if err := client.Initialize(context.Background(), &cred); err != nil {
+	if err := rpc.InitializeConn(context.Background(), conn, &cred, nil); err != nil {
 		return err
 	}
 
@@ -98,7 +94,7 @@ func rpcTool(ip string, port uint64, wipPath string, keyPath string) error {
 			continue
 		}
 
-		res, err := rpc.RoundTripRaw[any](context.Background(), client.Conn(), &req, nil)
+		res, err := rpc.RoundTripRaw[any](context.Background(), conn, &req, nil)
 		if err != nil {
 			return err
 		}
