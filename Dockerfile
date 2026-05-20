@@ -6,7 +6,7 @@ RUN make
 FROM ubuntu:24.04
 WORKDIR /signatory
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /signatory/signatory /usr/bin/signatory
 COPY --from=builder /signatory/signatory-cli /usr/bin/signatory-cli
