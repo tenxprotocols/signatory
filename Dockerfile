@@ -22,4 +22,4 @@ RUN groupadd -g ${GID} signatory && \
 
 USER signatory
 ENTRYPOINT ["/usr/bin/signatory"]
-CMD [ "-c", "/signatory/signatory.yaml" ]
+CMD ["serve"]
