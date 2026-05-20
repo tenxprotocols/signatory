@@ -8,7 +8,6 @@ WORKDIR /signatory
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /signatory/signatory.yaml /signatory/signatory.yaml
 COPY --from=builder /signatory/signatory /usr/bin/signatory
 COPY --from=builder /signatory/signatory-cli /usr/bin/signatory-cli
 
