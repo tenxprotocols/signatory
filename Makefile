@@ -7,21 +7,23 @@ COLLECTOR_PKG = github.com/ecadlabs/signatory/pkg/metrics
 PACKAGE_NAME          := github.com/ecadlabs/signatory
 GOLANG_CROSS_VERSION  ?= v1.25.5
 
-all: signatory signatory-cli
+all: signatory signatory-cli signatory-recovery-tool
 
 # build is controlled by Go build system, so mark phony to ignore file timestamps
-.PHONY: signatory signatory-cli
+.PHONY: signatory signatory-cli signatory-recovery-tool
 signatory:
 	CGO_ENABLED=1 go build -ldflags "-X $(COLLECTOR_PKG).GitRevision=$(GIT_REVISION) -X $(COLLECTOR_PKG).GitBranch=$(GIT_BRANCH)" ./cmd/signatory
 signatory-cli:
 	CGO_ENABLED=1 go build -ldflags "-X $(COLLECTOR_PKG).GitRevision=$(GIT_REVISION) -X $(COLLECTOR_PKG).GitBranch=$(GIT_BRANCH)" ./cmd/signatory-cli
+signatory-recovery-tool:
+	CGO_ENABLED=1 go build -ldflags "-X $(COLLECTOR_PKG).GitRevision=$(GIT_REVISION) -X $(COLLECTOR_PKG).GitBranch=$(GIT_BRANCH)" ./cmd/signatory-recovery-tool
 
 .PHONY: container
 container: signatory signatory-cli
 	docker build -t ecadlabs/signatory:$(CONTAINER_TAG) -f goreleaser.dockerfile .
 
 clean:
-	rm signatory signatory-cli
+	rm signatory signatory-cli signatory-recovery-tool
 
 .PHONY: release-dry-run
 release-dry-run:
