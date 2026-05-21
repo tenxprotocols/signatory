@@ -112,6 +112,17 @@ func doRPC[T any, C any](ctx context.Context, c *Client[C], fn func(net.Conn) (T
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// A previous reconnect attempt may have left c.conn nil (connectLocked
+	// closes the old conn before dialing, and a dial failure returns with
+	// c.conn already cleared). Re-establish here before dispatching, or
+	// fn would dereference a nil net.Conn.
+	if c.conn == nil {
+		if rerr := c.connectLocked(ctx); rerr != nil {
+			var zero T
+			return zero, fmt.Errorf("rpc reconnect failed: %w", rerr)
+		}
+	}
+
 	res, err := fn(c.conn)
 	if err == nil || !isConnError(err) || ctx.Err() != nil {
 		return res, err

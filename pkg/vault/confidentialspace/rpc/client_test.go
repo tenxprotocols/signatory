@@ -203,6 +203,50 @@ func TestSignReconnectsAfterPeerClose(t *testing.T) {
 	}
 }
 
+// TestSignRecoversAfterFailedReconnect drives the wedged-client
+// regression: when a reconnect attempt fails (server briefly
+// unreachable, e.g. during a confidential-VM host maintenance event),
+// the previous patch left c.conn == nil and every subsequent RPC
+// nil-derefed in RoundTripRaw. The Client must instead re-attempt the
+// reconnect on the next request and succeed once the peer is back.
+func TestSignRecoversAfterFailedReconnect(t *testing.T) {
+	srv := startFakeServer(t, []fakeServerBehavior{closeAfterInit, serveAll})
+
+	var dialOK atomic.Bool
+	dialOK.Store(true)
+	dial := func(ctx context.Context) (net.Conn, error) {
+		if !dialOK.Load() {
+			return nil, errors.New("simulated dial failure")
+		}
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", srv.Addr())
+	}
+	c := NewClient(dial, &ConfidentialSpaceCredentials{WipProviderPath: "p", EncryptionKeyPath: "k"})
+	t.Cleanup(func() { _ = c.Close() })
+
+	ctx := context.Background()
+	if err := c.Connect(ctx); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	// Peer has closed conn 1 (closeAfterInit). Block reconnect so the
+	// first Sign sees the closed socket *and* fails to redial.
+	dialOK.Store(false)
+	if _, err := c.Sign(ctx, 42, []byte("msg"), &vault.SignOptions{Version: utils.SigningVersion1}); err == nil {
+		t.Fatalf("Sign succeeded; expected reconnect failure")
+	}
+
+	// Peer is back. Next Sign must recover, not panic on a nil conn.
+	dialOK.Store(true)
+	sig, err := c.Sign(ctx, 42, []byte("msg"), &vault.SignOptions{Version: utils.SigningVersion1})
+	if err != nil {
+		t.Fatalf("Sign after recovery: %v", err)
+	}
+	if sig == nil || sig.Ed25519 == nil {
+		t.Fatalf("Sign returned nil signature: %+v", sig)
+	}
+}
+
 // TestSignDoesNotRetryAfterAppError: application-level errors from
 // the server pass through unchanged, with no reconnect.
 func TestSignDoesNotRetryAfterAppError(t *testing.T) {
