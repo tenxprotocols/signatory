@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	tz "github.com/ecadlabs/gotez/v2"
@@ -162,8 +163,9 @@ func (v *ConfidentialSpaceVault[C]) Import(ctx context.Context, pk crypt.Private
 		return nil, fmt.Errorf("(ConfidentialSpace): %w", err)
 	}
 	key := &confidentialKey{
-		pub:    p,
-		handle: res.Handle,
+		pub:          p,
+		handle:       res.Handle,
+		encryptedKey: res.EncryptedPrivateKey,
 	}
 	v.keys = append(v.keys, key)
 
@@ -209,8 +211,9 @@ func (v *ConfidentialSpaceVault[C]) Generate(ctx context.Context, keyType *crypt
 			return nil, fmt.Errorf("(ConfidentialSpace): %w", err)
 		}
 		key := &confidentialKey{
-			pub:    p,
-			handle: res.Handle,
+			pub:          p,
+			handle:       res.Handle,
+			encryptedKey: res.EncryptedPrivateKey,
 		}
 		v.keys = append(v.keys, key)
 		if err := v.storage.ImportKey(ctx, &encryptedKey{
@@ -241,6 +244,52 @@ func (v *ConfidentialSpaceVault[C]) Generate(ctx context.Context, keyType *crypt
 type confidentialKey struct {
 	pub    crypt.PublicKey
 	handle uint64
+	// encryptedKey is the KMS-wrapped blob the tee-signer needs to
+	// recover this key. Kept alongside the handle so re-Import after a
+	// tee-signer restart doesn't have to round-trip to Firestore on the
+	// signing hot path. See reimportLocked.
+	encryptedKey []byte
+}
+
+// isStaleHandleError reports whether err signals that the tee-signer no
+// longer recognizes the handle, which happens after a tee-signer VM
+// restart wipes its in-memory handle table. The tee-signer sends a
+// nested RPCError of the form {message:"signer error", source:{message:
+// "invalid handle"}}; both levels are checked in case the wrapping
+// changes upstream.
+func isStaleHandleError(err error) bool {
+	var rerr *rpc.RPCError
+	if !errors.As(err, &rerr) {
+		return false
+	}
+	for e := rerr; e != nil; e = e.Source {
+		if strings.EqualFold(strings.TrimSpace(e.Message), "invalid handle") {
+			return true
+		}
+	}
+	return false
+}
+
+// reimportLocked re-Imports k's encrypted blob into the tee-signer and
+// updates k.handle in place. Caller must hold v.mtx so concurrent Sign
+// or ProvePossession calls can't race against the handle update.
+//
+// This is the recovery path for the case where the tee-signer has
+// restarted and lost its in-memory handle table; the Firestore-backed
+// encrypted blob (cached in k.encryptedKey at import time) is the
+// source of truth.
+func (v *ConfidentialSpaceVault[C]) reimportLocked(ctx context.Context, k *confidentialKey) error {
+	if k.encryptedKey == nil {
+		return errors.New("no cached encrypted blob; cannot re-import after stale handle")
+	}
+	log.WithField("pkh", k.pub.Hash()).Info(
+		"tee-signer returned 'invalid handle'; re-importing key (signer likely restarted)")
+	res, err := v.client.Import(ctx, k.encryptedKey)
+	if err != nil {
+		return err
+	}
+	k.handle = res.Handle
+	return nil
 }
 
 type confidentialKeyRef[C any] struct {
@@ -256,6 +305,12 @@ func (r *confidentialKeyRef[C]) Sign(ctx context.Context, message []byte, opt *v
 	defer r.v.mtx.Unlock()
 
 	sig, err := r.v.client.Sign(ctx, r.handle, message, opt)
+	if isStaleHandleError(err) {
+		if rerr := r.v.reimportLocked(ctx, r.confidentialKey); rerr != nil {
+			return nil, fmt.Errorf("(ConfidentialSpace): reimport after stale handle: %w", rerr)
+		}
+		sig, err = r.v.client.Sign(ctx, r.handle, message, opt)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("(ConfidentialSpace): %w", err)
 	}
@@ -272,13 +327,19 @@ func (r *confidentialKeyRef[C]) ProvePossession(ctx context.Context) (crypt.Sign
 	defer r.v.mtx.Unlock()
 
 	sig, err := r.v.client.ProvePossession(ctx, r.handle)
+	if isStaleHandleError(err) {
+		if rerr := r.v.reimportLocked(ctx, r.confidentialKey); rerr != nil {
+			return nil, fmt.Errorf("(ConfidentialSpace): reimport after stale handle: %w", rerr)
+		}
+		sig, err = r.v.client.ProvePossession(ctx, r.handle)
+	}
 	if err != nil {
-		return nil, fmt.Errorf("(Nitro): %w", err)
+		return nil, fmt.Errorf("(ConfidentialSpace): %w", err)
 	}
 
 	res, err := sig.Signature()
 	if err != nil {
-		return nil, fmt.Errorf("(Nitro): %w", err)
+		return nil, fmt.Errorf("(ConfidentialSpace): %w", err)
 	}
 	return res, nil
 }
@@ -386,8 +447,9 @@ func newWithClient[C any](ctx context.Context, client *rpc.Client[C], storage ke
 			return nil, fmt.Errorf("(ConfidentialSpace): %w", err)
 		}
 		keys = append(keys, &confidentialKey{
-			pub:    p,
-			handle: res.Handle,
+			pub:          p,
+			handle:       res.Handle,
+			encryptedKey: k.EncryptedPrivateKey,
 		})
 	}
 	if err := r.Err(); err != nil {
