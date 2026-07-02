@@ -131,3 +131,30 @@ func TestWatermark(t *testing.T) {
 		}
 	})
 }
+
+// TestGCPWatermarkSupersededBy pins the GCP backend's conditional-write
+// validation to the same strictly monotonic (level, round) semantics the
+// DynamoDB backend enforces in its ConditionExpression.
+func TestGCPWatermarkSupersededBy(t *testing.T) {
+	stored := GCPWatermark{Request: "attestation", Level: 124, Round: 1}
+
+	cases := []struct {
+		name  string
+		level int32
+		round int32
+		want  bool
+	}{
+		{"higher level", 125, 0, true},
+		{"same level higher round", 124, 2, true},
+		{"same level same round", 124, 1, false},
+		{"same level lower round", 124, 0, false},
+		{"lower level higher round", 123, 5, false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			next := GCPWatermark{Request: "attestation", Level: c.level, Round: c.round}
+			assert.Equal(t, c.want, stored.supersededBy(&next))
+		})
+	}
+}

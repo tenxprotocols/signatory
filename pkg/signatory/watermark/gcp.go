@@ -3,7 +3,6 @@ package watermark
 import (
 	"context"
 	"fmt"
-	"time"
 
 	tz "github.com/ecadlabs/gotez/v2"
 	"github.com/ecadlabs/gotez/v2/crypt"
@@ -22,12 +21,12 @@ import (
 const (
 	defaultCollection = "watermark"
 
-	// transactionTimeout is a safety valve against an indefinitely stuck
-	// Firestore RPC, nothing more — correctness must never depend on its
-	// value. It is deliberately generous: Firestore's own server-side
-	// transaction limits expire a transaction long before this fires, so
-	// the transaction always gets to commit or roll back on its own terms.
-	transactionTimeout = 60 * time.Second
+	// casMaxAttempts bounds the conditional-write retry loop in
+	// checkAndSet. A lost race re-reads the fresh document and re-runs
+	// validation, which under contention almost always resolves to
+	// ErrWatermark (the competing request recorded the same operation),
+	// so the loop converges in one or two rounds.
+	casMaxAttempts = 4
 )
 
 type GCPConfig struct {
@@ -87,6 +86,13 @@ type GCPWatermark struct {
 	Digest  *tz.BlockPayloadHash `firestore:"digest"`
 }
 
+// supersededBy reports whether next advances strictly past w — the same
+// monotonic (level, round) condition the DynamoDB backend enforces in its
+// ConditionExpression ("lvl < :new_lvl or (lvl = :new_lvl and round < :new_round)").
+func (w *GCPWatermark) supersededBy(next *GCPWatermark) bool {
+	return w.Level < next.Level || (w.Level == next.Level && w.Round < next.Round)
+}
+
 func (f *GCP) IsSafeToSign(ctx context.Context, pkh crypt.PublicKeyHash, req core.SignRequest, digest *crypt.Digest) error {
 	m, ok := req.(request.WithWatermark)
 	if !ok {
@@ -105,56 +111,81 @@ func (f *GCP) IsSafeToSign(ctx context.Context, pkh crypt.PublicKeyHash, req cor
 		Digest:  wm.Hash.UnwrapPtr(),
 	}
 
-	// Detach from the caller's cancellation (context values are preserved):
-	// once the transaction starts it must commit or roll back cleanly no
-	// matter what the client does. Baker clients cancel sign requests
-	// aggressively (octez remote_calls_timeout); when that cancellation
-	// propagated into RunTransaction the SDK could neither commit nor roll
-	// back, orphaning the server-side transaction's document locks. With
-	// multiple bakers racing on the same key, each new request then queued
-	// behind the orphans, timed out, and orphaned its own transaction in
-	// turn — a self-sustaining livelock that blocked every mainnet
-	// attestation for ~2h on 2026-07-01.
-	txCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), transactionTimeout)
-	defer cancel()
-
 	opts := metrics.IOInterceptorOptions[bool]{
 		Backend:   "gcp",
 		Operation: "write",
 		TableName: f.colName,
 		TargetFunc: func() (bool, error) {
-			err := f.client.RunTransaction(txCtx, func(ctx context.Context, tx *firestore.Transaction) error {
-				docSnap, err := tx.Get(docRef) // Read document
-
-				if err != nil {
-					if status.Code(err) == codes.NotFound {
-						// Document doesn't exist, safe to create
-						tx.Set(docRef, newWm)
-						return nil
-					}
-					metrics.RecordIOError("gcp", status.Code(err).String(), f.colName, "write")
-					return fmt.Errorf("(GCPWatermark) IsSafeToSign: %w", err)
-				}
-
-				// Document exists, check watermark
-				var oldWm GCPWatermark
-				if err := docSnap.DataTo(&oldWm); err != nil {
-					metrics.RecordIOError("gcp", "decode_error", f.colName, "write")
-					return fmt.Errorf("(GCPWatermark) IsSafeToSign: %w", err)
-				}
-
-				if oldWm.Level >= newWm.Level && (oldWm.Level != newWm.Level || oldWm.Round >= newWm.Round) {
-					return ErrWatermark
-				}
-
-				tx.Set(docRef, newWm)
-				return nil
-			})
+			err := f.checkAndSet(ctx, docRef, &newWm)
 			return err == nil, err
 		},
 	}
 	_, err := metrics.IOInterceptor(&opts)
 	return err
+}
+
+// checkAndSet advances the watermark with a conditional write, mirroring
+// the DynamoDB backend's single conditional PutItem: validate the new
+// watermark against the current document, then write guarded by a
+// precondition (create-only for the first write, unchanged update time
+// otherwise). Unlike a read-write transaction this holds no server-side
+// locks, so a caller that gives up mid-request (e.g. a baker hitting
+// remote_calls_timeout) cannot leave the document locked against other
+// requests — the livelock behind the 2026-07 attestation outages, where
+// canceled transactions orphaned their locks and every subsequent request
+// queued behind them. A lost race surfaces as a failed precondition and
+// re-runs validation against the fresh document.
+func (f *GCP) checkAndSet(ctx context.Context, docRef *firestore.DocumentRef, newWm *GCPWatermark) error {
+	var lastErr error
+	for attempt := 0; attempt < casMaxAttempts; attempt++ {
+		docSnap, err := docRef.Get(ctx)
+
+		if err != nil {
+			if status.Code(err) == codes.NotFound {
+				// Document doesn't exist, safe to create. Create fails
+				// with AlreadyExists if a concurrent request wins the
+				// race to create it first.
+				if _, err = docRef.Create(ctx, newWm); err == nil {
+					return nil
+				}
+				if status.Code(err) == codes.AlreadyExists {
+					lastErr = err
+					continue
+				}
+			}
+			metrics.RecordIOError("gcp", status.Code(err).String(), f.colName, "write")
+			return fmt.Errorf("(GCPWatermark) IsSafeToSign: %w", err)
+		}
+
+		// Document exists, check watermark
+		var oldWm GCPWatermark
+		if err := docSnap.DataTo(&oldWm); err != nil {
+			metrics.RecordIOError("gcp", "decode_error", f.colName, "write")
+			return fmt.Errorf("(GCPWatermark) IsSafeToSign: %w", err)
+		}
+
+		if !oldWm.supersededBy(newWm) {
+			return ErrWatermark
+		}
+
+		_, err = docRef.Update(ctx, []firestore.Update{
+			{Path: "request", Value: newWm.Request},
+			{Path: "lvl", Value: newWm.Level},
+			{Path: "round", Value: newWm.Round},
+			{Path: "digest", Value: newWm.Digest},
+		}, firestore.LastUpdateTime(docSnap.UpdateTime))
+		if err == nil {
+			return nil
+		}
+		if status.Code(err) == codes.FailedPrecondition {
+			lastErr = err
+			continue
+		}
+		metrics.RecordIOError("gcp", status.Code(err).String(), f.colName, "write")
+		return fmt.Errorf("(GCPWatermark) IsSafeToSign: %w", err)
+	}
+	metrics.RecordIOError("gcp", "cas_exhausted", f.colName, "write")
+	return fmt.Errorf("(GCPWatermark) IsSafeToSign: conditional write retries exhausted: %w", lastErr)
 }
 
 func init() {
