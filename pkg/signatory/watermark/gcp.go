@@ -3,6 +3,7 @@ package watermark
 import (
 	"context"
 	"fmt"
+	"time"
 
 	tz "github.com/ecadlabs/gotez/v2"
 	"github.com/ecadlabs/gotez/v2/crypt"
@@ -20,6 +21,13 @@ import (
 
 const (
 	defaultCollection = "watermark"
+
+	// transactionTimeout is a safety valve against an indefinitely stuck
+	// Firestore RPC, nothing more — correctness must never depend on its
+	// value. It is deliberately generous: Firestore's own server-side
+	// transaction limits expire a transaction long before this fires, so
+	// the transaction always gets to commit or roll back on its own terms.
+	transactionTimeout = 60 * time.Second
 )
 
 type GCPConfig struct {
@@ -97,12 +105,25 @@ func (f *GCP) IsSafeToSign(ctx context.Context, pkh crypt.PublicKeyHash, req cor
 		Digest:  wm.Hash.UnwrapPtr(),
 	}
 
+	// Detach from the caller's cancellation (context values are preserved):
+	// once the transaction starts it must commit or roll back cleanly no
+	// matter what the client does. Baker clients cancel sign requests
+	// aggressively (octez remote_calls_timeout); when that cancellation
+	// propagated into RunTransaction the SDK could neither commit nor roll
+	// back, orphaning the server-side transaction's document locks. With
+	// multiple bakers racing on the same key, each new request then queued
+	// behind the orphans, timed out, and orphaned its own transaction in
+	// turn — a self-sustaining livelock that blocked every mainnet
+	// attestation for ~2h on 2026-07-01.
+	txCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), transactionTimeout)
+	defer cancel()
+
 	opts := metrics.IOInterceptorOptions[bool]{
 		Backend:   "gcp",
 		Operation: "write",
 		TableName: f.colName,
 		TargetFunc: func() (bool, error) {
-			err := f.client.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+			err := f.client.RunTransaction(txCtx, func(ctx context.Context, tx *firestore.Transaction) error {
 				docSnap, err := tx.Get(docRef) // Read document
 
 				if err != nil {
