@@ -22,7 +22,11 @@ type Dialer func(ctx context.Context) (net.Conn, error)
 // Client is a connection-managing CBOR-RPC client for the enclave
 // signer. RPCs are serialized; on a connection-level failure the
 // Client closes, redials, re-runs Initialize, and retries once.
-// Application errors and context cancellation are not retried.
+// Application errors are not retried. Context cancellation is not
+// retried either, and additionally discards the connection: the
+// protocol is lockstep (no request ids), so a round trip abandoned
+// mid-frame may leave the stale response in the stream, where it
+// would be read as the reply to the next RPC.
 type Client[C any] struct {
 	Logger Logger
 
@@ -124,7 +128,20 @@ func doRPC[T any, C any](ctx context.Context, c *Client[C], fn func(net.Conn) (T
 	}
 
 	res, err := fn(c.conn)
-	if err == nil || !isConnError(err) || ctx.Err() != nil {
+	if err == nil {
+		return res, err
+	}
+	if ctx.Err() != nil {
+		// The round trip was interrupted by cancellation, possibly
+		// mid-frame: the stream may still carry the abandoned response,
+		// which the lockstep protocol would deliver as the reply to the
+		// next RPC. Discard the connection; the nil-conn path above
+		// redials on the next call.
+		_ = c.conn.Close()
+		c.conn = nil
+		return res, err
+	}
+	if !isConnError(err) {
 		return res, err
 	}
 
