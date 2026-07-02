@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/ecadlabs/signatory/pkg/utils"
 	"github.com/ecadlabs/signatory/pkg/vault"
@@ -55,6 +56,10 @@ const (
 	// signReturnsAppError: handle Initialize, then return an
 	// application-level RPCError on Sign requests.
 	signReturnsAppError
+	// stallSign: handle Initialize, then never respond to Sign
+	// requests while keeping the connection open. Simulates a slow
+	// signer whose client gives up mid-round-trip.
+	stallSign
 )
 
 type fakeServer struct {
@@ -117,6 +122,13 @@ func (s *fakeServer) handle(conn net.Conn, b fakeServerBehavior) {
 		if err := cbor.Unmarshal(body, &req); err != nil {
 			s.t.Errorf("server: bad cbor: %v", err)
 			return
+		}
+
+		if b == stallSign && req.Sign != nil {
+			s.signCalls.Add(1)
+			// Swallow the request without answering; loop back to the
+			// read, which blocks until the client closes the conn.
+			continue
 		}
 
 		var respBytes []byte
@@ -244,6 +256,46 @@ func TestSignRecoversAfterFailedReconnect(t *testing.T) {
 	}
 	if sig == nil || sig.Ed25519 == nil {
 		t.Fatalf("Sign returned nil signature: %+v", sig)
+	}
+}
+
+// TestSignDiscardsConnAfterCancellation drives the response-desync
+// regression: the protocol is lockstep (no request ids), so a Sign
+// abandoned on cancellation may leave its response in the stream,
+// where the next RPC would read it as its own reply. After a canceled
+// round trip the Client must discard the connection and serve the
+// next RPC on a fresh one.
+func TestSignDiscardsConnAfterCancellation(t *testing.T) {
+	srv := startFakeServer(t, []fakeServerBehavior{stallSign, serveAll})
+	client := newTestClient(t, srv.Addr())
+
+	if err := client.Connect(context.Background()); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+
+	// Sign against the stalling server with a deadline: the round trip
+	// must be interrupted by the context, not by the peer.
+	shortCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if _, err := client.Sign(shortCtx, 42, []byte("msg"), &vault.SignOptions{Version: utils.SigningVersion1}); err == nil {
+		t.Fatalf("Sign succeeded; expected cancellation")
+	}
+
+	// The next Sign must run on a fresh connection (and therefore
+	// succeed), not reuse the poisoned stream. Bound it so a regression
+	// fails fast instead of hanging on the stalled conn.
+	ctx, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	sig, err := client.Sign(ctx, 42, []byte("msg"), &vault.SignOptions{Version: utils.SigningVersion1})
+	if err != nil {
+		t.Fatalf("Sign after cancellation: %v", err)
+	}
+	if sig == nil || sig.Ed25519 == nil {
+		t.Fatalf("Sign returned nil signature: %+v", sig)
+	}
+
+	if got := srv.conns.Load(); got != 2 {
+		t.Errorf("server saw %d connections, want 2 (poisoned conn must be discarded)", got)
 	}
 }
 
