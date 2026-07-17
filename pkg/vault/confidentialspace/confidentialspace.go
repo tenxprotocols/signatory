@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/ecadlabs/goblst/minpk"
 	tz "github.com/ecadlabs/gotez/v2"
 	"github.com/ecadlabs/gotez/v2/b58"
 	"github.com/ecadlabs/gotez/v2/crypt"
@@ -270,26 +271,57 @@ func isStaleHandleError(err error) bool {
 	return false
 }
 
-// reimportLocked re-Imports k's encrypted blob into the tee-signer and
-// updates k.handle in place. Caller must hold v.mtx so concurrent Sign
-// or ProvePossession calls can't race against the handle update.
+// reimportAllLocked re-Imports every key's encrypted blob into the
+// tee-signer and updates the handles in place. Caller must hold v.mtx
+// so concurrent Sign or ProvePossession calls can't race against the
+// handle updates.
 //
-// This is the recovery path for the case where the tee-signer has
-// restarted and lost its in-memory handle table; the Firestore-backed
-// encrypted blob (cached in k.encryptedKey at import time) is the
-// source of truth.
-func (v *ConfidentialSpaceVault[C]) reimportLocked(ctx context.Context, k *confidentialKey) error {
-	if k.encryptedKey == nil {
-		return errors.New("no cached encrypted blob; cannot re-import after stale handle")
+// This is the recovery path for the case where the tee-signer has lost
+// or rebuilt its in-memory handle table (restart, session reset). It
+// deliberately re-binds ALL keys, not just the one that observed the
+// failure: a table reset invalidates every cached handle at once, and a
+// sibling key's stale handle can silently collide with a freshly
+// allocated slot and sign with the wrong key (2026-07-17 mainnet
+// incident). Each returned public key is checked against the cached one
+// before the handle is adopted — a mismatch means the blob resolves to
+// foreign key material and must never be bound.
+func (v *ConfidentialSpaceVault[C]) reimportAllLocked(ctx context.Context, reason string) error {
+	log.WithField("reason", reason).Warn(
+		"tee-signer handle table presumed lost; re-importing all keys")
+	for _, k := range v.keys {
+		if k.encryptedKey == nil {
+			return fmt.Errorf("key %v has no cached encrypted blob; cannot re-import", k.pub.Hash())
+		}
+		res, err := v.client.Import(ctx, k.encryptedKey)
+		if err != nil {
+			return err
+		}
+		p, err := res.PublicKey.PublicKey()
+		if err != nil {
+			return err
+		}
+		if !p.Equal(k.pub) {
+			return fmt.Errorf("re-imported blob for %v resolved to foreign public key %v; refusing to bind",
+				k.pub.Hash(), p.Hash())
+		}
+		k.handle = res.Handle
 	}
-	log.WithField("pkh", k.pub.Hash()).Info(
-		"tee-signer returned 'invalid handle'; re-importing key (signer likely restarted)")
-	res, err := v.client.Import(ctx, k.encryptedKey)
-	if err != nil {
-		return err
-	}
-	k.handle = res.Handle
 	return nil
+}
+
+// verifySignature checks that sig is a valid signature by pub over
+// message, mirroring the signing-version semantics the signer applies
+// (BLS keys sign with the augmented ciphersuite under version 1 and the
+// default ciphersuite otherwise; other key types are version-independent).
+func verifySignature(pub crypt.PublicKey, sig crypt.Signature, message []byte, opt *vault.SignOptions) bool {
+	ver := utils.SigningVersionLatest
+	if opt != nil {
+		ver = opt.Version
+	}
+	if bpub, ok := pub.(*crypt.BLSPublicKey); ok && ver == utils.SigningVersion1 {
+		return bpub.VerifySignatureAugmented(sig, message)
+	}
+	return pub.VerifySignature(sig, message)
 }
 
 type confidentialKeyRef[C any] struct {
@@ -300,48 +332,85 @@ type confidentialKeyRef[C any] struct {
 func (r *confidentialKeyRef[C]) PublicKey() crypt.PublicKey { return r.pub }
 func (r *confidentialKeyRef[C]) Vault() vault.Vault         { return r.v }
 
-func (r *confidentialKeyRef[C]) Sign(ctx context.Context, message []byte, opt *vault.SignOptions) (crypt.Signature, error) {
-	r.v.mtx.Lock()
-	defer r.v.mtx.Unlock()
-
-	sig, err := r.v.client.Sign(ctx, r.handle, message, opt)
+// callVerified runs one enclave signing RPC and returns its result only
+// if it passes verify. It recovers at most once — from a stale handle
+// or from a verification failure — by re-binding all handles via
+// reimportAllLocked and re-issuing the call; call must therefore read
+// the key's current handle on each invocation. Caller must hold v.mtx.
+func (r *confidentialKeyRef[C]) callVerified(ctx context.Context, what string, call func() (*rpc.Signature, error), verify func(crypt.Signature) bool) (crypt.Signature, error) {
+	recovered := false
+	sig, err := call()
 	if isStaleHandleError(err) {
-		if rerr := r.v.reimportLocked(ctx, r.confidentialKey); rerr != nil {
+		if rerr := r.v.reimportAllLocked(ctx, "stale handle on "+what); rerr != nil {
 			return nil, fmt.Errorf("(ConfidentialSpace): reimport after stale handle: %w", rerr)
 		}
-		sig, err = r.v.client.Sign(ctx, r.handle, message, opt)
+		recovered = true
+		sig, err = call()
 	}
 	if err != nil {
 		return nil, fmt.Errorf("(ConfidentialSpace): %w", err)
 	}
-
 	res, err := sig.Signature()
 	if err != nil {
 		return nil, fmt.Errorf("(ConfidentialSpace): %w", err)
 	}
+
+	// The enclave is not trusted to have signed with the right key: a
+	// rebuilt handle table silently binds cached handles to foreign key
+	// material. Never return a result that does not verify.
+	if !verify(res) {
+		log.WithField("pkh", r.pub.Hash()).WithField("handle", r.handle).Errorf(
+			"enclave returned a %s that does not verify; re-binding all handles", what)
+		if !recovered {
+			if rerr := r.v.reimportAllLocked(ctx, what+" failed verification"); rerr != nil {
+				return nil, fmt.Errorf("(ConfidentialSpace): reimport after failed verification: %w", rerr)
+			}
+			if sig, err = call(); err != nil {
+				return nil, fmt.Errorf("(ConfidentialSpace): %w", err)
+			}
+			if res, err = sig.Signature(); err != nil {
+				return nil, fmt.Errorf("(ConfidentialSpace): %w", err)
+			}
+			if verify(res) {
+				return res, nil
+			}
+		}
+		return nil, fmt.Errorf("(ConfidentialSpace): %s by %v failed verification after handle re-bind", what, r.pub.Hash())
+	}
 	return res, nil
+}
+
+func (r *confidentialKeyRef[C]) Sign(ctx context.Context, message []byte, opt *vault.SignOptions) (crypt.Signature, error) {
+	r.v.mtx.Lock()
+	defer r.v.mtx.Unlock()
+
+	return r.callVerified(ctx, "signature",
+		func() (*rpc.Signature, error) { return r.v.client.Sign(ctx, r.handle, message, opt) },
+		func(sig crypt.Signature) bool { return verifySignature(r.pub, sig, message, opt) })
+}
+
+// verifyPossession checks a BLS proof of possession against pub. Proofs
+// for non-BLS keys have no defined verification here and are accepted
+// as-is.
+func verifyPossession(pub crypt.PublicKey, sig crypt.Signature) bool {
+	bpub, ok := pub.(*crypt.BLSPublicKey)
+	if !ok {
+		return true
+	}
+	bsig, ok := sig.(*crypt.BLSSignature)
+	if !ok {
+		return false
+	}
+	return minpk.VerifyProof((*minpk.PublicKey)(bpub), (*minpk.Signature)(bsig)) == nil
 }
 
 func (r *confidentialKeyRef[C]) ProvePossession(ctx context.Context) (crypt.Signature, error) {
 	r.v.mtx.Lock()
 	defer r.v.mtx.Unlock()
 
-	sig, err := r.v.client.ProvePossession(ctx, r.handle)
-	if isStaleHandleError(err) {
-		if rerr := r.v.reimportLocked(ctx, r.confidentialKey); rerr != nil {
-			return nil, fmt.Errorf("(ConfidentialSpace): reimport after stale handle: %w", rerr)
-		}
-		sig, err = r.v.client.ProvePossession(ctx, r.handle)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("(ConfidentialSpace): %w", err)
-	}
-
-	res, err := sig.Signature()
-	if err != nil {
-		return nil, fmt.Errorf("(ConfidentialSpace): %w", err)
-	}
-	return res, nil
+	return r.callVerified(ctx, "proof of possession",
+		func() (*rpc.Signature, error) { return r.v.client.ProvePossession(ctx, r.handle) },
+		func(sig crypt.Signature) bool { return verifyPossession(r.pub, sig) })
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////
@@ -445,6 +514,11 @@ func newWithClient[C any](ctx context.Context, client *rpc.Client[C], storage ke
 		if err != nil {
 			_ = client.Close()
 			return nil, fmt.Errorf("(ConfidentialSpace): %w", err)
+		}
+		if string(p.Hash().ToBase58()) != string(k.PublicKeyHash.ToBase58()) {
+			_ = client.Close()
+			return nil, fmt.Errorf("(ConfidentialSpace): blob stored for %v resolved to foreign public key %v; refusing to bind",
+				k.PublicKeyHash, p.Hash())
 		}
 		keys = append(keys, &confidentialKey{
 			pub:          p,
